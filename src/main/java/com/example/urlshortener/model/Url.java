@@ -35,5 +35,6 @@ public class Url {
     private Instant expiresAt;
 
     @Column(nullable = false)
+    @Builder.Default
     private Integer clickCount = 0;
 }

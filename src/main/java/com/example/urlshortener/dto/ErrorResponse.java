@@ -1,4 +1,9 @@
 package com.example.urlshortener.dto;
 
-public record ErrorResponse() {
-}
+import java.time.Instant;
+
+public record ErrorResponse(
+        int status,
+        String message,
+        Instant timestamp
+) {}
