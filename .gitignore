@@ -32,8 +32,18 @@ build/
 ### VS Code ###
 .vscode/
 
+### Secrets ###
+.env
+
+### Local tooling ###
+.mcp.json
+
 src/main/resources/application.yml
+
+### Personal notes / design docs (not part of the repo) ###
 src/main/java/com/example/urlshortener/allabouttheproject.md
 ClaudeMemories.md
 HELP.md
 start.md
+docker-setup.md
+docs/

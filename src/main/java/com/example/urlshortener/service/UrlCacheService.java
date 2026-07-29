@@ -25,6 +25,12 @@ public class UrlCacheService {
             return MAX_TTL; // no expiry set, cache for default 24h
         }
         Duration timeUntilExpiry = Duration.between(Instant.now(), expiresAt);
+        // Guard: an already-expired (or expiring-right-now) URL must never get a
+        // zero/negative TTL. Redis rejects a non-positive TTL, and a zero TTL would
+        // otherwise mean "store forever" — which would serve an expired URL from cache.
+        if (timeUntilExpiry.isZero() || timeUntilExpiry.isNegative()) {
+            return Duration.ofSeconds(1);
+        }
         return timeUntilExpiry.compareTo(MAX_TTL) < 0 ? timeUntilExpiry : MAX_TTL;
     }
 

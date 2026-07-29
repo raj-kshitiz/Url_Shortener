@@ -1,0 +1,27 @@
+# Build output — the image builds its own, we never want the host's
+target/
+
+# IDE / editor
+.idea/
+*.iml
+*.iws
+*.ipr
+.vscode/
+.settings/
+.classpath
+.project
+
+# VCS
+.git/
+.gitignore
+.gitattributes
+
+# Docker's own files (no need to ship them into the build context)
+Dockerfile
+.dockerignore
+compose.yaml
+.env
+
+# Docs & notes
+*.md
+docs/

@@ -4,7 +4,9 @@ import com.example.urlshortener.dto.AnalyticsResponse;
 import com.example.urlshortener.dto.ClickEventsDTO;
 import com.example.urlshortener.dto.ShortenRequest;
 import com.example.urlshortener.dto.ShortenResponse;
-import com.example.urlshortener.exceptions.ShortUrlNotFoundException;
+import com.example.urlshortener.exceptions.CustomAliasAlreadyTakenException;
+import com.example.urlshortener.exceptions.UrlExpiredException;
+import com.example.urlshortener.exceptions.UrlNotFoundException;
 import com.example.urlshortener.model.ClickEvents;
 import com.example.urlshortener.model.Url;
 import com.example.urlshortener.repository.ClickEventsRepository;
@@ -39,12 +41,12 @@ public class UrlService {
     }
 
     public ShortenResponse addUrl(ShortenRequest request) {
+        boolean isCustomAlias = request.customAlias() != null && !request.customAlias().isBlank();
         String shortCode;
-        if (request.customAlias() != null && !request.customAlias().isBlank()) {
+        if (isCustomAlias) {
             // user provided their own alias
             if (urlRepository.existsByShortCode(request.customAlias())) {
-                // throw new CustomAliasAlreadyTakenException(request.customAlias());
-                throw new RuntimeException("Custom alias already taken: " + request.customAlias()); // -> Placeholder only
+                throw new CustomAliasAlreadyTakenException(request.customAlias());
             }
             shortCode = request.customAlias();
         } else {
@@ -59,7 +61,7 @@ public class UrlService {
 
         Url url = Url.builder()
                 .originalUrl(request.originalUrl())
-                .customAlias(request.customAlias() != null)
+                .customAlias(isCustomAlias)
                 .expiresAt(request.expiresAt())
                 .shortCode(shortCode)
                 .build();
@@ -75,14 +77,14 @@ public class UrlService {
         if(urlCacheService.isCached(shortCode)) {
             log.info("URL found in cache: {}", shortCode);
             originalUrl = urlCacheService.getCachedUrl(shortCode)
-                    .orElseThrow(() -> new ShortUrlNotFoundException("Cached URL missing for: " + shortCode));
+                    .orElseThrow(() -> new UrlNotFoundException(shortCode));
 
         } else {
             Url url = urlRepository.findByShortCode(shortCode)
-                    .orElseThrow(() -> new ShortUrlNotFoundException("No URL found for short code: " + shortCode));
+                    .orElseThrow(() -> new UrlNotFoundException(shortCode));
 
             if (url.getExpiresAt() != null && url.getExpiresAt().isBefore(Instant.now())) {
-                throw new ShortUrlNotFoundException("Short URL has expired: " + shortCode);
+                throw new UrlExpiredException(shortCode);
             }
             originalUrl = url.getOriginalUrl();
             urlCacheService.cacheUrl(shortCode, url.getOriginalUrl(), url.getExpiresAt());
@@ -103,7 +105,7 @@ public class UrlService {
 
     public AnalyticsResponse getAnalytics(String shortCode) {
         Url url = urlRepository.findByShortCode(shortCode)
-                .orElseThrow(() -> new ShortUrlNotFoundException("No URL found for short code: " + shortCode));
+                .orElseThrow(() -> new UrlNotFoundException(shortCode));
 
         List<ClickEvents> clickEvents = clickEventsRepository.findByShortCode(shortCode);
 

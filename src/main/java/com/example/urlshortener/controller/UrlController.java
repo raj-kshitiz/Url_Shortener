@@ -4,6 +4,7 @@ import com.example.urlshortener.dto.AnalyticsResponse;
 import com.example.urlshortener.dto.ShortenRequest;
 import com.example.urlshortener.dto.ShortenResponse;
 import com.example.urlshortener.service.UrlService;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -19,7 +20,7 @@ public class UrlController {
 
     @PostMapping("/api/urls")
     public ResponseEntity<ShortenResponse> addUrl(
-            @RequestBody ShortenRequest request
+            @Valid @RequestBody ShortenRequest request
     ) {
         return new ResponseEntity<>(
                 urlService.addUrl(request),
