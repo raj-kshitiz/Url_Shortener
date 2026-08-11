@@ -1,0 +1,42 @@
+server:
+  port: 8080
+
+spring:
+  # Loads .env (gitignored) for local runs. "optional:" means startup still works
+  # without it — e.g. in Docker, where compose supplies the same values as real
+  # env vars, which take precedence over anything imported here.
+  config:
+    import: optional:file:.env[.properties]
+
+  datasource:
+    url: jdbc:postgresql://localhost:5432/${POSTGRES_DB}
+    username: ${POSTGRES_USER}
+    password: ${POSTGRES_PASSWORD}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+  flyway:
+    enabled: true             # the default; stated here so it's visible
+    locations: classpath:db/migration
+    baseline-on-migrate: false
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+  mongodb:
+    uri: mongodb://localhost:27017/${MONGO_DB}
+
+  cache:
+    type: redis
+
+app:
+  base-url: http://localhost:8080

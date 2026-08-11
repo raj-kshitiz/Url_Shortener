@@ -38,12 +38,15 @@ build/
 ### Local tooling ###
 .mcp.json
 
-src/main/resources/application.yml
+# NOTE: src/main/resources/application.yml is intentionally NOT ignored.
+# It holds no secrets — every credential is a ${ENV_VAR} placeholder resolved
+# from .env (gitignored) or from real env vars in Docker. The app cannot start
+# without it, so a clone must include it.
 
 ### Personal notes / design docs (not part of the repo) ###
 src/main/java/com/example/urlshortener/allabouttheproject.md
-ClaudeMemories.md
+docs/ClaudeMemories.md
 HELP.md
-start.md
-docker-setup.md
+docs/start.md
+docs/docker-setup.md
 docs/
