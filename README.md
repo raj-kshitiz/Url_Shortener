@@ -168,7 +168,7 @@ having one.
 ### Option A — everything in Docker (recommended)
 
 ```bash
-git clone <repo-url>
+git clone https://github.com/raj-kshitiz/Url_Shortener
 cd URLShortener
 
 # 1. Create your local env file. Nothing secret is committed to this repo;
