@@ -44,7 +44,7 @@ build/
 # without it, so a clone must include it.
 
 ### Personal notes / design docs (not part of the repo) ###
-src/main/java/com/example/urlshortener/allabouttheproject.md
+docs/allabouttheproject.md
 docs/ClaudeMemories.md
 HELP.md
 docs/start.md

@@ -23,6 +23,9 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # Default is 10s, which is shorter than the executor's 20s termination window —
+    # SIGKILL would land while click events were still draining from the queue.
+    stop_grace_period: 30s
     restart: unless-stopped
 
   postgres:

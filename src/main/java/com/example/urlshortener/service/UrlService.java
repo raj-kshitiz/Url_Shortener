@@ -29,6 +29,7 @@ public class UrlService {
     private final UrlRepository urlRepository;
     private final UrlCacheService urlCacheService;
     private final ClickEventsRepository clickEventsRepository;
+    private final ClickTrackingService clickTrackingService;   // for queuing click events to be processed
 
     @Value("${app.base-url}")
     private String baseUrl;
@@ -71,7 +72,7 @@ public class UrlService {
         return mapToShortenResponseDTO(url);
     }
 
-    @Transactional
+//    @Transactional --> gone because we have queued the mongo write using async
     public String getOriginalUrl(String shortCode, String ipAddress, String userAgent, String referer) {
         String originalUrl;
         if(urlCacheService.isCached(shortCode)) {
@@ -91,14 +92,8 @@ public class UrlService {
         }
         urlRepository.incrementClickCount(shortCode);
 
-        ClickEvents clickEvents = ClickEvents.builder()
-                .shortCode(shortCode)
-                .timestamp(Instant.now())
-                .ipAddress(ipAddress)
-                .userAgent(userAgent)
-                .referer(referer)
-                .build();
-        clickEventsRepository.save(clickEvents);
+        // was: ClickEvents.builder()…  clickEventsRepository.save(clickEvents);
+        clickTrackingService.recordClick(shortCode, Instant.now(), ipAddress, userAgent, referer);
 
         return originalUrl;
     }
