@@ -10,7 +10,7 @@ read-heavy, latency-sensitive operation with a write side-effect, and the three 
 exist to keep those concerns apart.
 
 ```bash
-git clone <repo-url> && cd URLShortener
+git clone https://github.com/raj-kshitiz/Url_Shortener && cd URLShortener
 cp .env.example .env          # edit POSTGRES_PASSWORD
 docker compose up --build     # app + Postgres + Mongo + Redis
 ```
