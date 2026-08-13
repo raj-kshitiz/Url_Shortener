@@ -70,12 +70,6 @@ public class ClickCounterService {
 
     /**
      * On a normal shutdown, don't throw away the last 30s of counts.
-     *
-     * Not @PreDestroy: Spring closes a context by publishing ContextClosedEvent,
-     * THEN stopping every Lifecycle bean, and only then destroying beans. Since
-     * LettuceConnectionFactory is a SmartLifecycle, a @PreDestroy flush finds Redis
-     * already stopped and dies with "LettuceConnectionFactory has been STOPPED".
-     * The event fires while both Redis and the datasource are still usable.
      */
     @EventListener(ContextClosedEvent.class)
     public void flushOnShutdown() {

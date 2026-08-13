@@ -38,6 +38,12 @@ build/
 ### Local tooling ###
 .mcp.json
 
+### Benchmarks ###
+# The k6 summaries are committed — they are the evidence behind the numbers in the
+# README. The application logs each run produces are not: one of them is 3 MB of
+# stack traces from deliberately racing the old code.
+benchmarks/results/*.app.log
+
 # NOTE: src/main/resources/application.yml is intentionally NOT ignored.
 # It holds no secrets — every credential is a ${ENV_VAR} placeholder resolved
 # from .env (gitignored) or from real env vars in Docker. The app cannot start

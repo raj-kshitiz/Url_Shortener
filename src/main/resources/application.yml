@@ -15,6 +15,13 @@ spring:
     driver-class-name: org.postgresql.Driver
 
   jpa:
+    # Off, for two reasons. Nothing needs it: entities never leave the service layer,
+    # so there is no lazy association being touched while rendering a response. And it
+    # would break addUrl's retry — with OSIV on, every save in a request shares one
+    # EntityManager, and JPA says a persistence context is unusable after a failed
+    # flush. The second attempt would fail on the wreckage of the first.
+    open-in-view: false
+
     hibernate:
       ddl-auto: validate
     show-sql: true

@@ -1,0 +1,11 @@
+
+requests                 45320
+throughput (req/s)       754.5
+non-302 responses        0
+failed requests          0
+latency avg (ms)         66.15
+latency p50 (ms)         63.91
+latency p90 (ms)         79.21
+latency p95 (ms)         85.95
+latency p99 (ms)         101.90
+latency max (ms)         168.51

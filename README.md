@@ -24,6 +24,7 @@ Then `curl -X POST localhost:8080/api/urls -H 'Content-Type: application/json' -
 - [Architecture](#architecture)
 - [Why three datastores](#why-three-datastores)
 - [How a redirect works](#how-a-redirect-works)
+- [Benchmarks](#benchmarks)
 - [Running it](#running-it)
 - [API](#api)
 - [Data model](#data-model)
@@ -204,6 +205,85 @@ redirect — 1,000 clicks on one link meant 1,000 writes to the same row. Batchi
 in Redis turns that into roughly two writes, and takes Postgres off the hot path
 entirely. The trade is that `click_count` in Postgres lags by up to 30 seconds; the
 analytics endpoint adds the un-flushed Redis delta back so the API never shows the lag.
+
+---
+
+## Benchmarks
+
+"Took Postgres off the hot path" is a claim, and a claim about latency is worth nothing
+without a number next to it. So:
+
+**p99 redirect latency: 101.9 ms → 4.2 ms. Sustained throughput: 754 → 20,919 req/s.**
+
+### Redirect hot path
+
+`GET /{shortCode}`, 50 concurrent clients, 60 seconds, one already-cached short code.
+
+| | Before (`af440c7`) | After (`HEAD`) | |
+|---|---:|---:|---|
+| Throughput | 754 req/s | **20,919 req/s** | 27.7× |
+| Latency p50 | 63.91 ms | **2.23 ms** | 28.7× lower |
+| Latency p90 | 79.21 ms | **2.97 ms** | 26.7× lower |
+| Latency p95 | 85.95 ms | **3.30 ms** | 26.0× lower |
+| Latency p99 | 101.90 ms | **4.22 ms** | 24.1× lower |
+| Latency max | 168.51 ms | **17.56 ms** | 9.6× lower |
+| Failed requests | 0 | 0 | |
+
+"Before" is the last commit prior to this phase, where a redirect ran a synchronous
+Mongo insert *and* an `UPDATE url SET click_count = click_count + 1` inside one
+transaction. Fifty clients on one popular link means fifty writers queueing for the same
+row — the 64 ms median is mostly that queue, not Postgres being slow. "After" is the
+same endpoint once the Mongo write moved to a bounded executor and the counter became an
+`HINCRBY`, and its 2.2 ms median is two Redis round-trips plus Spring's request
+plumbing.
+
+No analytics were traded away for it. Counting warmup and measurement together, the
+"after" build served 1,596,265 redirects and left exactly 1,596,265 documents in
+`click_events` and a `click_count` of 1,596,265 once the shutdown flush landed — no
+drift in either direction, at 20k redirects a second. The executor's 10,000-deep queue
+never filled at that rate, so `DiscardPolicy` never had to drop anything; it is what
+makes the drop survivable if it ever does.
+
+### The `addUrl` race
+
+Same harness, pointed at `POST /api/urls`: 1,000 requests over 40 custom aliases, 25
+concurrent attempts per alias, so every alias is contested. One request per alias can
+legitimately win; the question is what the other 24 are told.
+
+| | Before | After |
+|---|---:|---:|
+| `201 Created` | 40 | 40 |
+| `409 Conflict` | 801 | **960** |
+| `500 Internal Server Error` | **159** | **0** |
+
+The 159 fives were the check-then-act window: `existsByShortCode` said the alias was
+free, another request took it, and the unique index rejected the insert as an unhandled
+error. The winner count is unchanged — the constraint was always doing its job. What
+changed is that the loser now gets told it lost.
+
+### Method, and what these numbers are not
+
+```bash
+docker compose up -d postgres mongo redis
+benchmarks/run.sh target/URLShortener-0.0.1-SNAPSHOT.jar after                    # redirect
+benchmarks/run.sh target/URLShortener-0.0.1-SNAPSHOT.jar race-after alias-race.js # the race
+```
+
+`benchmarks/run.sh` starts a jar, creates a fresh short code, runs a 20-second warmup
+that is thrown away, then measures with [k6](https://k6.io/) and writes the summary to
+`benchmarks/results/`. Both builds went through that same script, back to back, against
+the same containers, on the same JVM (Corretto 26 on an AMD Ryzen 7 6800H, 16 threads,
+14 GB). Logging was pinned to `WARN` with `show-sql=false` for both, because the old
+build emits SQL on every redirect and leaving that on would have credited the change
+with console I/O it did not earn.
+
+Three caveats, because the number is only worth as much as its method:
+
+- **k6 shares the machine with the app and all three datastores.** The 20,919 req/s is a
+  floor bounded by this laptop, not a capacity figure for the service.
+- **One hot short code, always a cache hit.** That is deliberate — it is the path the
+  change was aimed at. It says nothing about a cache miss, which still reads Postgres.
+- **The absolute numbers are this machine's.** The ratio is the portable part.
 
 ---
 
@@ -413,7 +493,7 @@ from a single `@RestControllerAdvice`, so clients never have to parse two error 
 |---|---|
 | `400 Bad Request` | Missing or malformed `originalUrl` (bean validation) |
 | `404 Not Found` | Unknown short code |
-| `409 Conflict` | Requested custom alias is already taken |
+| `409 Conflict` | Requested custom alias is already taken — including when it was taken by a request still in flight ([measured](#the-addurl-race)) |
 | `410 Gone` | The link existed but has passed its `expiresAt` |
 | `500 Internal Server Error` | Anything unhandled — logged server-side, generic message returned |
 
@@ -462,8 +542,59 @@ the entity and the migrated schema disagree — it never alters the schema itsel
 **Short codes are random, not sequential.** A counter encoded in Base62 is faster to
 generate and guarantees uniqueness for free, but it makes every link enumerable — anyone
 can walk the keyspace and read every URL ever shortened. Codes are drawn randomly from
-`[62⁵, 62⁶)` so every code is exactly 6 characters, giving ~56 billion possibilities, and
-the generator loops until it finds an unused one.
+`[62⁵, 62⁶)` so every code is exactly 6 characters, giving ~56 billion possibilities.
+
+**The unique index is the uniqueness check, not `existsByShortCode`.** `addUrl` used to
+ask whether a code was free and then insert it. There is no answer to that question that
+stays true long enough to act on: between the `SELECT` and the `INSERT`, another request
+can take the code, and the loser got a 500 — [159 of them per 1,000 contested
+requests](#the-addurl-race).
+
+```mermaid
+sequenceDiagram
+  autonumber
+  participant A as Request A
+  participant B as Request B
+  participant P as PostgreSQL
+
+  A->>P: SELECT … WHERE short_code = 'my-link'
+  P-->>A: free
+  B->>P: SELECT … WHERE short_code = 'my-link'
+  P-->>B: free
+  Note over A,B: both now believe the alias is theirs
+
+  A->>P: INSERT
+  P-->>A: committed → 201
+  B->>P: INSERT
+  P-->>B: uk_url_short_code violated
+  Note over B,P: was: unhandled → 500<br/>now: caught → 409 for an alias,<br/>redraw for a generated code
+```
+
+Only the database can decide this atomically, so it does, and `addUrl`'s job is to
+translate the constraint violation into the right answer:
+
+- **a custom alias** the user asked for by name becomes a `409`, the same answer the
+  pre-check would have given a moment earlier. It is not retried under a different code —
+  the user asked for *that* one, and quietly substituting another would be worse than the
+  conflict.
+- **a generated code** carries no such expectation, so a collision is not an error to
+  report — it is a reason to draw again, bounded at five attempts so an exhausted
+  keyspace fails loudly instead of spinning.
+
+The pre-check survives for custom aliases only, and only as an optimisation: it makes the
+ordinary "that name is taken" answer cost a `SELECT` rather than a failed `INSERT`. For
+generated codes it is gone entirely, which removes a `SELECT` from every create.
+
+The catch is narrow on purpose. `original_url` is `VARCHAR(2048)`, so an over-long URL
+also arrives as a `DataIntegrityViolationException`, and reporting that as "alias already
+taken" would be a lie — so the handler checks that the violated constraint is
+`uk_url_short_code` and rethrows anything else.
+
+**`open-in-view` is off**, which that retry depends on. With OSIV on, every save in a
+request shares one `EntityManager`, and JPA says a persistence context is unusable after
+a failed flush — the second attempt would run on the wreckage of the first. It was
+already unnecessary here (entities never leave the service layer, so nothing lazy is
+touched during rendering); the retry is what made it load-bearing.
 
 **Expiry is enforced in two places, deliberately.** Postgres holds `expires_at` and the
 lookup checks it. But a cached entry never re-reads Postgres, so the cache TTL is capped at
@@ -558,9 +689,10 @@ Stated plainly, because they are the roadmap.
 - **Redis is now load-bearing for counting, not just caching.** It was already required for
   the redirect path, so this adds no new dependency — but it raises the stakes on the
   phase-3 circuit breaker.
-- **`addUrl` has a check-then-act race.** `existsByShortCode` followed by `save` can
-  interleave between two concurrent requests; the unique constraint catches it, but the
-  loser gets a 500 rather than a clean retry or a 409.
+- **An over-long `originalUrl` returns 500, not 400.** The column is `VARCHAR(2048)` and
+  nothing validates the length before the insert, so the database rejects it and the
+  generic handler turns that into a 500. It is at least honestly a 500 now rather than a
+  mislabelled 409, but the fix is a `@Size(max = 2048)` on the request.
 - **A missing short code hits Postgres every time.** There is no negative caching, so a
   flood of requests for nonexistent codes passes straight through the cache.
 - **No rate limiting and no authentication.** Anyone can create links, and analytics for
@@ -576,15 +708,16 @@ Stated plainly, because they are the roadmap.
 | Phase | Work | Status |
 |---|---|---|
 | **1 — Credible** | Docker Compose for all three stores · credentials moved to env vars · Flyway migrations · this README | ✅ Done |
-| **2 — Fix the hot path** | ✅ `@Async` click events on a bounded, own-policy executor · ✅ misleading `@Transactional` moved to the repository · ✅ Redis counter hash with a 30s `@Scheduled` flush to Postgres · fix the `addUrl` race · benchmark before/after and publish the numbers | ⏳ In progress |
+| **2 — Fix the hot path** | `@Async` click events on a bounded, own-policy executor · misleading `@Transactional` moved to the repository · Redis counter hash with a 30s `@Scheduled` flush to Postgres · `addUrl` race fixed by insert-and-catch · [benchmarked, numbers published](#benchmarks) | ✅ Done |
 | **3 — Defensible** | Negative caching for missing codes · Redis token-bucket rate limiting returning `429` · circuit breaker on Redis with a Postgres fallback, demonstrated by killing Redis | Planned |
 | **4 — Multi-tenant** | Signup/login with Spring Security and JWT · links get an owner, analytics check ownership, redirects stay public · per-user API keys driving the rate limiter | Planned |
 | **5 — Observable** | Actuator + Micrometer + Prometheus + Grafana · dashboards for cache hit ratio, redirect latency and clicks/sec | Planned |
 
-Phase 2 is the one that matters, and the datastore work in it is done: a cache-hit
-redirect now touches Redis and nothing else. Benchmark numbers for the redirect endpoint
-go here next — one honest before/after covering both changes, rather than a number per
-half-measure.
+Phase 2 is the one that matters, and it is finished: a cache-hit redirect now touches
+Redis and nothing else, which is worth **24× lower p99 latency and 27× the throughput**
+on the numbers above, and creating a link no longer returns a 500 when two requests
+collide. Phase 3 starts from a measured baseline rather than an assumption — the same
+harness re-runs against every change after this one.
 
 ---
 
@@ -596,6 +729,10 @@ URLShortener/
 ├── Dockerfile                    # multi-stage, layered, non-root runtime
 ├── .env.example                  # template — copy to .env, which is gitignored
 ├── pom.xml                       # Spring Boot 4.0.6, Java 21
+├── benchmarks/                   # run.sh (start jar → warm up → measure → stop),
+│   ├── redirect.js               #   k6 load profile for GET /{shortCode}
+│   ├── alias-race.js             #   k6 script that contests one alias from many VUs
+│   └── results/                  #   committed k6 summaries behind the README numbers
 └── src/main/
     ├── java/com/example/urlshortener/
     │   ├── controller/           # UrlController — the three endpoints

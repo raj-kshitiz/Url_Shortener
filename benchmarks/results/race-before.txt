@@ -1,0 +1,7 @@
+
+aliases contested        40 (25 concurrent attempts each)
+requests                 1000
+201 Created              40
+409 Conflict             801
+500 Server Error         159
+other status             0
