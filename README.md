@@ -38,54 +38,71 @@ Then `curl -X POST localhost:8080/api/urls -H 'Content-Type: application/json' -
 
 ```mermaid
 flowchart TB
-    client["Client<br/><i>browser / curl</i>"]
 
-    subgraph app["Spring Boot application :8080"]
-        direction TB
-        controller["<b>UrlController</b><br/>POST /api/urls<br/>GET /{shortCode}<br/>GET /api/urls/{code}/analytics"]
-        handler["<b>GlobalExceptionHandler</b><br/>@RestControllerAdvice<br/>maps exceptions to 400/404/409/410/500"]
-        service["<b>UrlService</b><br/>shorten · resolve · analytics"]
-        cache["<b>UrlCacheService</b><br/>read-through cache, TTL-aware"]
-        base62["<b>Base62Encoding</b><br/>6-char code generation"]
-        clicks["<b>ClickTrackingService</b><br/>@Async('clickEventExecutor')<br/><i>separate bean — @Async only<br/>engages across a proxy boundary</i>"]
-        pool["<b>clickEventExecutor</b><br/>8 threads · bounded queue 10k<br/>DiscardPolicy on overload"]
-        counter["<b>ClickCounterService</b><br/>HINCRBY on redirect<br/><i>no Postgres on the hot path</i>"]
-        flush["<b>@Scheduled flush</b><br/>every 30s · atomic RENAME snapshot<br/><i>also runs on ContextClosedEvent</i>"]
-        flyway["<b>Flyway</b><br/>versioned schema migrations<br/><i>runs at startup</i>"]
+  client(["Client<br/><i>browser / curl</i>"])
+
+  subgraph app["Spring Boot Application :8080"]
+    direction TB
+
+    controller["<b>UrlController</b><br/>POST /api/urls<br/>GET /{shortCode}<br/>GET /api/urls/{code}/analytics"]
+    handler["<b>GlobalExceptionHandler</b><br/>@RestControllerAdvice<br/>maps exceptions → 400/404/409/410/500"]
+    service["<b>UrlService</b><br/>shorten · resolve · analytics"]
+    cache["<b>UrlCacheService</b><br/>read-through cache, TTL-aware"]
+    base62["<b>Base62Encoding</b><br/>6-char code generation"]
+    flyway["<b>Flyway</b><br/>versioned schema migrations<br/><i>runs at startup</i>"]
+
+    subgraph asyncPath["Async Analytics Path"]
+      direction TB
+      clicks["<b>ClickTrackingService</b><br/>@Async('clickEventExecutor')<br/><i>separate bean — @Async only<br/>engages across a proxy boundary</i>"]
+      pool["<b>clickEventExecutor</b><br/>8 threads · bounded queue 10k<br/>DiscardPolicy on overload"]
+      counter["<b>ClickCounterService</b><br/>HINCRBY on redirect<br/><i>no Postgres on the hot path</i>"]
+      flush["<b>@Scheduled flush</b><br/>every 30s · atomic RENAME snapshot<br/><i>also runs on ContextClosedEvent</i>"]
     end
+  end
 
-    subgraph data["Datastores"]
-        direction LR
-        pg[("<b>PostgreSQL</b><br/>url table<br/><i>source of truth</i>")]
-        redis[("<b>Redis</b><br/>shorturl:{code} → url<br/>clicks:pending hash<br/><i>cache + click counter</i>")]
-        mongo[("<b>MongoDB</b><br/>click_events<br/><i>append-only analytics</i>")]
-    end
+  subgraph data["Datastores"]
+    direction LR
+    pg[("<b>PostgreSQL</b><br/>url table<br/><i>source of truth</i>")]
+    redis[("<b>Redis</b><br/>shorturl:{code} → url<br/>clicks:pending hash<br/><i>cache + click counter</i>")]
+    mongo[("<b>MongoDB</b><br/>click_events<br/><i>append-only analytics</i>")]
+  end
 
-    client -->|"HTTP"| controller
-    controller --> service
-    controller -.->|"throws"| handler
-    handler -.->|"JSON ErrorResponse"| client
-    service --> cache
-    service --> base62
-    service -->|"read / write link"| pg
-    service ==>|"<b>hands off, does not wait</b>"| clicks
-    service ==>|"<b>HINCRBY, one round-trip</b>"| counter
-    clicks --> pool
-    pool -.->|"append click event<br/><i>on a click-N thread</i>"| mongo
-    counter -->|"HINCRBY clicks:pending"| redis
-    flush -.->|"RENAME + HGETALL"| redis
-    flush -.->|"one UPDATE per code, batched<br/><i>on the scheduling-1 thread</i>"| pg
-    service -->|"read events for analytics"| mongo
-    cache -->|"GET / SETEX"| redis
-    flyway -->|"applies V1__…sql<br/>on boot"| pg
-    controller -->|"302 Found<br/>Location: original URL"| client
+  client -->|HTTP| controller
+  controller --> service
+  controller -.->|throws| handler
+  handler -.->|JSON ErrorResponse| client
+  controller -->|"302 Found<br/>Location: original URL"| client
 
-    classDef store fill:#eef4ff,stroke:#4a6fa5,stroke-width:1px,color:#1a2a3a
-    classDef comp fill:#f7f7f5,stroke:#8a8a80,stroke-width:1px,color:#2a2a28
-    classDef async fill:#fff4e6,stroke:#c08a3e,stroke-width:1px,color:#3a2a18
-    class pg,redis,mongo store
-    class controller,service,cache,base62,handler,flyway comp
-    class clicks,pool,counter,flush async
+  service --> cache
+  service --> base62
+  service -->|read / write link| pg
+  service -->|read events| mongo
+  service ==>|"hands off, does not wait"| clicks
+  service ==>|"HINCRBY, one round-trip"| counter
+
+  clicks --> pool
+  pool -.->|"append click event<br/><i>on a click-N thread</i>"| mongo
+  counter -->|HINCRBY clicks:pending| redis
+
+  flush -.->|RENAME + HGETALL| redis
+  flush -.->|"one UPDATE per code, batched<br/><i>on scheduling-1 thread</i>"| pg
+
+  cache -->|GET / SETEX| redis
+  flyway -->|"applies V1__…sql<br/>on boot"| pg
+
+  classDef store fill:#eef4ff,stroke:#4a6fa5,stroke-width:1.5px,color:#1a2a3a,rx:6,ry:6
+  classDef comp fill:#f7f7f5,stroke:#8a8a80,stroke-width:1px,color:#2a2a28,rx:6,ry:6
+  classDef async fill:#fff4e6,stroke:#c08a3e,stroke-width:1.5px,color:#3a2a18,rx:6,ry:6
+  classDef client fill:#e8f5e9,stroke:#4a8f57,stroke-width:1.5px,color:#1a3a1e
+
+  class pg,redis,mongo store
+  class controller,service,cache,base62,handler,flyway comp
+  class clicks,pool,counter,flush async
+  class client client
+
+  style app fill:#fcfcfc,stroke:#cccccc,stroke-width:1px
+  style asyncPath fill:#fffaf2,stroke:#e0b876,stroke-width:1px,stroke-dasharray: 4 3
+  style data fill:#f5f8ff,stroke:#b8c9e8,stroke-width:1px
 ```
 
 The thick arrows mark the boundary between what the client waits for and what it
@@ -117,45 +134,63 @@ The short version: **one store owns correctness, one owns latency, one owns volu
 
 ```mermaid
 sequenceDiagram
-    autonumber
+  autonumber
+
+  box rgb(232,245,233) Client
     participant C as Client
+  end
+  box rgb(247,247,245) Spring Boot App
     participant A as UrlController
     participant S as UrlService
+  end
+  box rgb(238,244,255) Datastores
     participant R as Redis
     participant P as PostgreSQL
+  end
+  box rgb(255,244,230) Async Analytics Path
     participant T as ClickTrackingService<br/>(click-N thread)
     participant M as MongoDB
     participant F as Flush job<br/>(scheduling-1 thread)
+  end
 
-    C->>A: GET /{shortCode}
-    A->>S: getOriginalUrl(code, ip, ua, referer)
+  C->>A: GET /{shortCode}
+  A->>S: getOriginalUrl(code, ip, ua, referer)
+  S->>R: EXISTS shorturl:{code}
 
-    S->>R: EXISTS shorturl:{code}
-
+  rect rgb(238,244,255)
     alt cache hit
-        R-->>S: original URL
-        Note over S,R: no Postgres read at all
+      R-->>S: original URL
+      Note over S,R: no Postgres read at all
     else cache miss
-        S->>P: SELECT … WHERE short_code = ?
-        P-->>S: Url row
-        Note over S: 404 if absent · 410 if expires_at is past
-        S->>R: SETEX shorturl:{code} <ttl> <url>
-        Note over S,R: TTL = min(time until expiry, 24h)<br/>so an expired link cannot outlive its cache entry
+      S->>P: SELECT … WHERE short_code = ?
+      P-->>S: Url row
+      Note over S: 404 if absent · 410 if expires_at is past
+      S->>R: SETEX shorturl:{code} <ttl> <url>
+      Note over S,R: TTL = min(time until expiry, 24h)<br/>so an expired link cannot outlive its cache entry
     end
+  end
 
-    S->>R: HINCRBY clicks:pending {code} 1
+  S->>R: HINCRBY clicks:pending {code} 1
+
+  rect rgb(255,244,230)
     S-)T: recordClick(code, now, ip, ua, referer)
     Note over S,T: hands off and returns — the client<br/>does not wait for anything below
-    S-->>A: original URL
-    A-->>C: 302 Found + Location header
+  end
 
+  S-->>A: original URL
+  A-->>C: 302 Found + Location header
+
+  rect rgb(255,244,230)
     T->>M: insert click event
     Note over T,M: Mongo can be slow, or down, without<br/>the redirect noticing
+  end
 
+  rect rgb(255,244,230)
     F->>R: RENAME clicks:pending clicks:flushing
     R-->>F: whole hash, one HGETALL
     F->>P: UPDATE url SET click_count = click_count + :delta
     Note over F,P: every 30s, one UPDATE per code that<br/>was actually clicked — not one per click
+  end
 ```
 
 **What the client actually waits for:** two Redis round-trips on a cache hit, and
