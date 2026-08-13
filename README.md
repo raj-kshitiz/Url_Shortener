@@ -49,13 +49,15 @@ flowchart TB
         base62["<b>Base62Encoding</b><br/>6-char code generation"]
         clicks["<b>ClickTrackingService</b><br/>@Async('clickEventExecutor')<br/><i>separate bean — @Async only<br/>engages across a proxy boundary</i>"]
         pool["<b>clickEventExecutor</b><br/>8 threads · bounded queue 10k<br/>DiscardPolicy on overload"]
+        counter["<b>ClickCounterService</b><br/>HINCRBY on redirect<br/><i>no Postgres on the hot path</i>"]
+        flush["<b>@Scheduled flush</b><br/>every 30s · atomic RENAME snapshot<br/><i>also runs on ContextClosedEvent</i>"]
         flyway["<b>Flyway</b><br/>versioned schema migrations<br/><i>runs at startup</i>"]
     end
 
     subgraph data["Datastores"]
         direction LR
         pg[("<b>PostgreSQL</b><br/>url table<br/><i>source of truth</i>")]
-        redis[("<b>Redis</b><br/>shorturl:{code} → url<br/><i>cache, TTL ≤ 24h</i>")]
+        redis[("<b>Redis</b><br/>shorturl:{code} → url<br/>clicks:pending hash<br/><i>cache + click counter</i>")]
         mongo[("<b>MongoDB</b><br/>click_events<br/><i>append-only analytics</i>")]
     end
 
@@ -65,10 +67,14 @@ flowchart TB
     handler -.->|"JSON ErrorResponse"| client
     service --> cache
     service --> base62
-    service -->|"read / write link<br/>increment click_count"| pg
+    service -->|"read / write link"| pg
     service ==>|"<b>hands off, does not wait</b>"| clicks
+    service ==>|"<b>HINCRBY, one round-trip</b>"| counter
     clicks --> pool
     pool -.->|"append click event<br/><i>on a click-N thread</i>"| mongo
+    counter -->|"HINCRBY clicks:pending"| redis
+    flush -.->|"RENAME + HGETALL"| redis
+    flush -.->|"one UPDATE per code, batched<br/><i>on the scheduling-1 thread</i>"| pg
     service -->|"read events for analytics"| mongo
     cache -->|"GET / SETEX"| redis
     flyway -->|"applies V1__…sql<br/>on boot"| pg
@@ -79,12 +85,13 @@ flowchart TB
     classDef async fill:#fff4e6,stroke:#c08a3e,stroke-width:1px,color:#3a2a18
     class pg,redis,mongo store
     class controller,service,cache,base62,handler,flyway comp
-    class clicks,pool async
+    class clicks,pool,counter,flush async
 ```
 
-The thick arrow into `ClickTrackingService` is the boundary between what the client
-waits for and what it doesn't: everything past it runs on a `click-N` thread after
-the `302` has already been sent.
+The thick arrows mark the boundary between what the client waits for and what it
+doesn't. A redirect touches Redis and nothing else: the click event is handed to a
+`click-N` thread, and the counter is a single `HINCRBY` that a background job folds
+into Postgres later. Both finish after the `302` has already been sent.
 
 Everything runs from a single `docker compose up`: the application image is built from the
 multi-stage `Dockerfile`, and the three datastores come up alongside it with healthchecks,
@@ -99,7 +106,7 @@ This is the question an interviewer will ask, so here is the answer up front.
 | Store | What lives there | Why not somewhere else |
 |---|---|---|
 | **PostgreSQL** | The `url` record: short code, original URL, expiry, click count | The short-code → URL mapping is the one thing that must never be lost or duplicated. It needs a real uniqueness constraint (`uk_url_short_code`), and it needs ACID. |
-| **Redis** | `shorturl:{code}` → original URL, TTL-bounded | The redirect is the hot path and it is overwhelmingly reads of a tiny, immutable value. Serving it from Postgres means a network round-trip plus a B-tree lookup for something that never changes. |
+| **Redis** | `shorturl:{code}` → original URL, TTL-bounded; plus the `clicks:pending` counter hash | The redirect is the hot path and it is overwhelmingly reads of a tiny, immutable value. Serving it from Postgres means a network round-trip plus a B-tree lookup for something that never changes. The click counter lives here too, because 1,000 clicks on one link should be 1,000 in-memory increments and *one* Postgres write, not 1,000 `UPDATE`s to the same row. |
 | **MongoDB** | One document per click: timestamp, IP, user agent, referer | Click events are high-volume, append-only, never updated, and schema-loose (geolocation is being added, and the shape will keep changing). Putting them in Postgres means unbounded row growth in the same database that serves the hot path. |
 
 The short version: **one store owns correctness, one owns latency, one owns volume.**
@@ -118,6 +125,7 @@ sequenceDiagram
     participant P as PostgreSQL
     participant T as ClickTrackingService<br/>(click-N thread)
     participant M as MongoDB
+    participant F as Flush job<br/>(scheduling-1 thread)
 
     C->>A: GET /{shortCode}
     A->>S: getOriginalUrl(code, ip, ua, referer)
@@ -135,7 +143,7 @@ sequenceDiagram
         Note over S,R: TTL = min(time until expiry, 24h)<br/>so an expired link cannot outlive its cache entry
     end
 
-    S->>P: UPDATE url SET click_count = click_count + 1
+    S->>R: HINCRBY clicks:pending {code} 1
     S-)T: recordClick(code, now, ip, ua, referer)
     Note over S,T: hands off and returns — the client<br/>does not wait for anything below
     S-->>A: original URL
@@ -143,18 +151,24 @@ sequenceDiagram
 
     T->>M: insert click event
     Note over T,M: Mongo can be slow, or down, without<br/>the redirect noticing
+
+    F->>R: RENAME clicks:pending clicks:flushing
+    R-->>F: whole hash, one HGETALL
+    F->>P: UPDATE url SET click_count = click_count + :delta
+    Note over F,P: every 30s, one UPDATE per code that<br/>was actually clicked — not one per click
 ```
 
-**What the client actually waits for:** the Redis lookup, and one Postgres `UPDATE`. The
-click event is handed to a bounded thread pool and the request returns immediately — a
-Mongo stall no longer shows up as redirect latency, and a Mongo outage no longer turns a
-cacheable redirect into a 500.
+**What the client actually waits for:** two Redis round-trips on a cache hit, and
+nothing else. No Postgres, no Mongo. The click event goes to a bounded thread pool;
+the counter is a single `HINCRBY` that the flush job folds into Postgres 30 seconds
+later. A Mongo stall no longer shows up as redirect latency, and a Mongo outage no
+longer turns a cacheable redirect into a 500.
 
-**The honest note on what's left:** that `UPDATE` at step 9 is still synchronous, so every
-redirect writes to Postgres. It is now the whole of the remaining hot-path cost, and it's
-what the Redis `INCR` + `@Scheduled` flush on the [roadmap](#roadmap) removes. Called out
-rather than hidden, because knowing where your own bottleneck is matters more than not
-having one.
+**Where the cost went:** the counter used to be a synchronous `UPDATE` on every
+redirect — 1,000 clicks on one link meant 1,000 writes to the same row. Batching them
+in Redis turns that into roughly two writes, and takes Postgres off the hot path
+entirely. The trade is that `click_count` in Postgres lags by up to 30 seconds; the
+analytics endpoint adds the un-flushed Redis delta back so the API never shows the lag.
 
 ---
 
@@ -260,6 +274,26 @@ Recorded click for 3kFq2a on click-1                   ← async, correct
 Recorded click for 3kFq2a on http-nio-8080-exec-1      ← would mean the proxy was bypassed
 ```
 
+**Watch the counter batch up.** Click a link ten times, then look at both stores
+before the flush fires:
+
+```bash
+for i in $(seq 1 10); do curl -s -o /dev/null http://localhost:8080/3kFq2a; done
+
+docker compose exec redis redis-cli HGETALL clicks:pending
+# → 3kFq2a  10                          ← counted in memory
+
+docker compose exec postgres psql -U "$POSTGRES_USER" -d url_shortener \
+  -c "select click_count from url where short_code='3kFq2a';"
+# → 0                                   ← Postgres hasn't been told yet
+
+curl -s http://localhost:8080/api/urls/3kFq2a/analytics    # totalClicks: 10
+```
+
+Within 30 seconds Postgres reads `10` and `clicks:pending` is gone. `totalClicks`
+reads `10` the whole time — the endpoint adds the un-flushed delta, so the batching
+is invisible from outside.
+
 ### Configuration reference
 
 | Variable | Used by | Default | Purpose |
@@ -305,9 +339,10 @@ optional; without an alias, a 6-character Base62 code is generated.
 
 ### `GET /{shortCode}` — redirect
 
-Returns **`302 Found`** with the original URL in the `Location` header. Records a click
-event and increments the counter. Optional `X-Forwarded-For`, `User-Agent` and `Referer`
-headers are captured for analytics.
+Returns **`302 Found`** with the original URL in the `Location` header. On a cache hit
+this touches Redis only — the click event goes to a background thread and the counter is
+a Redis increment flushed to Postgres later. Optional `X-Forwarded-For`, `User-Agent` and
+`Referer` headers are captured for analytics.
 
 ### `GET /api/urls/{shortCode}/analytics`
 
@@ -331,8 +366,8 @@ headers are captured for analytics.
 }
 ```
 
-`totalClicks` is the aggregate counter from Postgres; `clicks` is the per-event detail from
-Mongo.
+`totalClicks` is the Postgres counter plus whatever is still un-flushed in Redis, so it
+is accurate the moment you ask; `clicks` is the per-event detail from Mongo.
 
 ### Errors
 
@@ -361,7 +396,7 @@ from a single `@RestControllerAdvice`, so clients never have to parse two error 
 | `custom_alias` | `BOOLEAN` | `NOT NULL` — was the code user-supplied |
 | `created_at` | `TIMESTAMPTZ` | set by Hibernate `@CreationTimestamp` |
 | `expires_at` | `TIMESTAMPTZ` | nullable — null means never expires |
-| `click_count` | `INTEGER` | `NOT NULL`, incremented by an atomic `UPDATE` |
+| `click_count` | `INTEGER` | `NOT NULL`, advanced in batches by the 30s flush, never per click |
 
 Schema changes are versioned SQL files under `src/main/resources/db/migration`, applied by
 Flyway on startup. Hibernate runs with `ddl-auto: validate`, so it will refuse to start if
@@ -419,9 +454,34 @@ table or a broker.
 `getOriginalUrl`, where it implied the Postgres update and the Mongo insert committed
 together. They never did — Mongo isn't a JDBC resource and takes no part in a JDBC
 transaction. With the Mongo write now async, the annotation had nothing left to describe,
-so it moved down onto `incrementClickCount`, which is a `@Modifying` query and genuinely
-requires a transaction. The write got its own short transaction, which is all it ever
-actually was.
+so it moved down onto the `@Modifying` counter update, which genuinely requires a
+transaction. The write got its own short transaction, which is all it ever actually was.
+
+**The click counter is one Redis Hash, not one key per code.** `INCR clicks:{code}` is
+the obvious design, and it leaves the flush job unable to answer "which links changed?"
+without `KEYS clicks:*` (blocks the server) or `SCAN` plus a read per key. A single
+`clicks:pending` hash makes the hot path `HINCRBY` and the flush a single `HGETALL`.
+
+**The flush snapshots with `RENAME`, because `HGETALL` + `DEL` loses clicks.** Any
+increment landing between the read and the delete is destroyed by the delete. `RENAME`
+is atomic: the instant it returns, `clicks:pending` no longer exists, and clicks
+arriving during the Postgres write go into a fresh hash and are picked up next cycle.
+If the Postgres write fails, `clicks:flushing` is deliberately *not* deleted and the
+next cycle retries it — so a failure double-counts rather than loses, which is the
+right direction for a click counter.
+
+**The shutdown flush is a `ContextClosedEvent` listener, not `@PreDestroy`.** This one
+is only learnable by testing it. Spring closes a context by publishing
+`ContextClosedEvent`, then stopping every `Lifecycle` bean, then destroying beans —
+and `LettuceConnectionFactory` is a `SmartLifecycle`, so a `@PreDestroy` flush finds
+Redis already stopped and dies with `LettuceConnectionFactory has been STOPPED`. The
+counts sit in Redis until the next boot, and nothing in the happy path reveals it.
+Listening for the event runs the flush while both Redis and the datasource are open.
+
+**Analytics adds back what hasn't been flushed.** `click_count` in Postgres lags by up
+to 30 seconds, so `getAnalytics` returns `click_count + pendingFor(code)`. Without it,
+clicking a link and immediately checking analytics reports zero — a batching decision
+leaking into the API as what looks like a bug.
 
 **Flyway instead of `ddl-auto: update`.** Hibernate's auto-DDL silently mutates the schema
 on startup, which is fine on a laptop and unacceptable anywhere else — there is no review,
@@ -449,12 +509,20 @@ still draining its 20s termination window.
 
 Stated plainly, because they are the roadmap.
 
-- **The click counter is still a synchronous Postgres write.** Every redirect blocks on
-  `UPDATE url SET click_count = …`. This is now the only remaining hot-path write, and the
-  next thing to go.
+- **Click counts can be lost, and can be double-counted.** Redis is AOF-persisted and the
+  app flushes on shutdown, so a graceful stop is safe. A `kill -9` of Redis loses up to 30
+  seconds of counts; a failed flush retries the same snapshot and may count it twice. Both
+  are acceptable for a click counter and would be wrong for anything billable.
+- **Analytics can dip for the duration of a flush.** Between the `RENAME` and the Postgres
+  commit, those counts are in `clicks:flushing` — no longer visible to `pendingFor`, not yet
+  in `click_count`. The window is milliseconds, and closing it means having analytics read
+  both keys.
 - **Click events can be lost.** By design (see above), but worth stating plainly: on a hard
   kill (`kill -9`, OOM) in-flight and queued events are gone, and during a sustained Mongo
   outage they are discarded. A graceful shutdown drains the queue within 20s.
+- **Redis is now load-bearing for counting, not just caching.** It was already required for
+  the redirect path, so this adds no new dependency — but it raises the stakes on the
+  phase-3 circuit breaker.
 - **`addUrl` has a check-then-act race.** `existsByShortCode` followed by `save` can
   interleave between two concurrent requests; the unique constraint catches it, but the
   loser gets a 500 rather than a clean retry or a 409.
@@ -473,15 +541,15 @@ Stated plainly, because they are the roadmap.
 | Phase | Work | Status |
 |---|---|---|
 | **1 — Credible** | Docker Compose for all three stores · credentials moved to env vars · Flyway migrations · this README | ✅ Done |
-| **2 — Fix the hot path** | ✅ `@Async` click events on a bounded, own-policy executor · ✅ misleading `@Transactional` moved to the repository · Redis `INCR` counter with a `@Scheduled` flush to Postgres · fix the `addUrl` race · benchmark before/after and publish the numbers | ⏳ In progress |
+| **2 — Fix the hot path** | ✅ `@Async` click events on a bounded, own-policy executor · ✅ misleading `@Transactional` moved to the repository · ✅ Redis counter hash with a 30s `@Scheduled` flush to Postgres · fix the `addUrl` race · benchmark before/after and publish the numbers | ⏳ In progress |
 | **3 — Defensible** | Negative caching for missing codes · Redis token-bucket rate limiting returning `429` · circuit breaker on Redis with a Postgres fallback, demonstrated by killing Redis | Planned |
 | **4 — Multi-tenant** | Signup/login with Spring Security and JWT · links get an owner, analytics check ownership, redirects stay public · per-user API keys driving the rate limiter | Planned |
 | **5 — Observable** | Actuator + Micrometer + Prometheus + Grafana · dashboards for cache hit ratio, redirect latency and clicks/sec | Planned |
 
-Phase 2 is the one that matters. The Mongo write is off the request path; the Postgres
-counter write is not yet. Benchmark numbers for the redirect endpoint will be published
-here once both are done — one honest before/after on the full hot path is worth more than
-two half-measurements.
+Phase 2 is the one that matters, and the datastore work in it is done: a cache-hit
+redirect now touches Redis and nothing else. Benchmark numbers for the redirect endpoint
+go here next — one honest before/after covering both changes, rather than a number per
+half-measure.
 
 ---
 
@@ -497,12 +565,14 @@ URLShortener/
     ├── java/com/example/urlshortener/
     │   ├── controller/           # UrlController — the three endpoints
     │   ├── service/              # UrlService (orchestration), UrlCacheService (Redis),
-    │   │                         #   ClickTrackingService (@Async Mongo write)
+    │   │                         #   ClickTrackingService (@Async Mongo write),
+    │   │                         #   ClickCounterService (Redis counter + @Scheduled flush)
     │   ├── repository/           # UrlRepository (JPA), ClickEventsRepository (Mongo)
     │   ├── model/                # Url (JPA entity), ClickEvents (Mongo document)
     │   ├── dto/                  # request/response records — entities never leave the service
     │   ├── exceptions/           # domain exceptions + GlobalExceptionHandler
-    │   ├── config/               # RedisConfig (serializers), AsyncConfig (executor + @EnableAsync)
+    │   ├── config/               # RedisConfig (serializers),
+    │   │                         #   AsyncConfig (executor + @EnableAsync + @EnableScheduling)
     │   └── utilities/            # Base62Encoding
     └── resources/
         ├── application.yml       # env-var placeholders only, no secrets

@@ -16,7 +16,7 @@ public interface UrlRepository extends JpaRepository<Url, Long> {
     boolean existsByShortCode(String shortCode);
 
     @Modifying
-    @Transactional   // org.springframework.transaction.annotation.Transactional
-    @Query("UPDATE Url u SET u.clickCount = u.clickCount + 1 WHERE u.shortCode = :shortCode")
-    void incrementClickCount(@Param("shortCode") String shortCode);
+    @Transactional
+    @Query("UPDATE Url u SET u.clickCount = u.clickCount + :delta WHERE u.shortCode = :shortCode")
+    void addToClickCount(@Param("shortCode") String shortCode, @Param("delta") long delta);
 }

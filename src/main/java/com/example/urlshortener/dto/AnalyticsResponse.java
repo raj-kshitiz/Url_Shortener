@@ -8,6 +8,6 @@ public record AnalyticsResponse(
         String originalUrl,
         Instant createdAt,
         Instant expiresAt,
-        Integer totalClicks,        // from Url.clickCount (PostgreSQL)
+        long totalClicks,        // from Url.clickCount (PostgreSQL)
         List<ClickEventsDTO> clicks  // from ClickEvents collection (MongoDB)
 ) {}

@@ -30,6 +30,7 @@ public class UrlService {
     private final UrlCacheService urlCacheService;
     private final ClickEventsRepository clickEventsRepository;
     private final ClickTrackingService clickTrackingService;   // for queuing click events to be processed
+    private final ClickCounterService clickCounterService;
 
     @Value("${app.base-url}")
     private String baseUrl;
@@ -90,7 +91,7 @@ public class UrlService {
             originalUrl = url.getOriginalUrl();
             urlCacheService.cacheUrl(shortCode, url.getOriginalUrl(), url.getExpiresAt());
         }
-        urlRepository.incrementClickCount(shortCode);
+        clickCounterService.increment(shortCode);
 
         // was: ClickEvents.builder()…  clickEventsRepository.save(clickEvents);
         clickTrackingService.recordClick(shortCode, Instant.now(), ipAddress, userAgent, referer);
@@ -113,7 +114,7 @@ public class UrlService {
                 url.getOriginalUrl(),
                 url.getCreatedAt(),
                 url.getExpiresAt(),
-                url.getClickCount(),
+                url.getClickCount() + clickCounterService.pendingFor(shortCode),
                 clickEventsDTOs
         );
     }
